@@ -8,6 +8,7 @@ const claimBaseSQL = `
 		  AND job.processed_at IS NULL
 		  AND job.dead_lettered_at IS NULL
 		  AND job.available_at <= $1
+		  AND (job.scheduled_at IS NULL OR job.scheduled_at <= $1)
 		  AND (job.lease_until IS NULL OR job.lease_until <= $1)
 		ORDER BY job.available_at, job.id
 		FOR UPDATE SKIP LOCKED
@@ -32,6 +33,7 @@ const claimOrderedSQL = `
 		  AND job.processed_at IS NULL
 		  AND job.dead_lettered_at IS NULL
 		  AND job.available_at <= $1
+		  AND (job.scheduled_at IS NULL OR job.scheduled_at <= $1)
 		  AND (job.lease_until IS NULL OR job.lease_until <= $1)
 		  AND NOT EXISTS (
 			SELECT 1

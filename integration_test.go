@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -397,4 +398,344 @@ func TestWorkerRunStopsOnCancel(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("worker did not stop")
 	}
+}
+
+type metricEvent struct {
+	Name  string
+	Kind  string
+	Delta int64
+}
+
+type recordingMetrics struct {
+	mu     sync.Mutex
+	events []metricEvent
+}
+
+func (metrics *recordingMetrics) record(name, kind string, delta int64) {
+	metrics.mu.Lock()
+	defer metrics.mu.Unlock()
+	metrics.events = append(metrics.events, metricEvent{Name: name, Kind: kind, Delta: delta})
+}
+
+func (metrics *recordingMetrics) Published(kind string) { metrics.record("published", kind, 0) }
+
+func (metrics *recordingMetrics) Delivered(kind string) { metrics.record("delivered", kind, 0) }
+
+func (metrics *recordingMetrics) Failed(kind string) { metrics.record("failed", kind, 0) }
+
+func (metrics *recordingMetrics) Retried(kind string) { metrics.record("retried", kind, 0) }
+
+func (metrics *recordingMetrics) DeadLettered(kind string) { metrics.record("dead_lettered", kind, 0) }
+
+func (metrics *recordingMetrics) Pending(kind string, delta int64) {
+	metrics.record("pending", kind, delta)
+}
+
+func (metrics *recordingMetrics) snapshot() []metricEvent {
+	metrics.mu.Lock()
+	defer metrics.mu.Unlock()
+	return append([]metricEvent(nil), metrics.events...)
+}
+
+func (metrics *recordingMetrics) count(name string) int {
+	metrics.mu.Lock()
+	defer metrics.mu.Unlock()
+	total := 0
+	for _, event := range metrics.events {
+		if event.Name == name {
+			total++
+		}
+	}
+	return total
+}
+
+func mustMetricEvents(t *testing.T, metrics *recordingMetrics, want []metricEvent) {
+	t.Helper()
+	if got := metrics.snapshot(); !slices.Equal(got, want) {
+		t.Fatalf("metric events = %#v, want %#v", got, want)
+	}
+}
+
+func TestMetricsFollowLifecycleTransitions(t *testing.T) {
+	ctx := context.Background()
+	metrics := &recordingMetrics{}
+	queue := testQueue(t,
+		pgoutbox.WithMetrics(metrics),
+		pgoutbox.WithMaxAttempts(2),
+		pgoutbox.WithBackoff(pgoutbox.Backoff{Base: 20 * time.Millisecond, Max: 20 * time.Millisecond}),
+	)
+	aggregate := uuid.New()
+	created, err := queue.Enqueue(ctx, input("export", aggregate))
+	if err != nil || !created {
+		t.Fatalf("enqueue = %t, %v", created, err)
+	}
+	if duplicate, err := queue.Enqueue(ctx, input("export", aggregate)); err != nil || duplicate {
+		t.Fatalf("duplicate enqueue = %t, %v", duplicate, err)
+	}
+	first := mustFoundClaim(t, queue, "export", "worker-1")
+	if !mustFail(t, queue, first, "first failure") {
+		t.Fatal("fail returned false")
+	}
+	time.Sleep(40 * time.Millisecond)
+	second := mustFoundClaim(t, queue, "export", "worker-1")
+	if !mustFail(t, queue, second, "second failure") {
+		t.Fatal("fail returned false")
+	}
+	if !mustRetry(t, queue, first.ID) {
+		t.Fatal("retry returned false")
+	}
+	redelivered := mustFoundClaim(t, queue, "export", "worker-1")
+	if redelivered.ID != first.ID || redelivered.Attempts != 1 {
+		t.Fatalf("redelivered job = %#v", redelivered)
+	}
+	if !mustComplete(t, queue, redelivered) {
+		t.Fatal("complete returned false")
+	}
+	mustStatsEqual(t, queue, nil, pgoutbox.Stats{})
+	mustMetricEvents(t, metrics, []metricEvent{
+		{Name: "published", Kind: "export"},
+		{Name: "pending", Kind: "export", Delta: 1},
+		{Name: "pending", Kind: "export", Delta: -1},
+		{Name: "failed", Kind: "export"},
+		{Name: "pending", Kind: "export", Delta: 1},
+		{Name: "pending", Kind: "export", Delta: -1},
+		{Name: "dead_lettered", Kind: "export"},
+		{Name: "retried", Kind: "export"},
+		{Name: "pending", Kind: "export", Delta: 1},
+		{Name: "pending", Kind: "export", Delta: -1},
+		{Name: "delivered", Kind: "export"},
+	})
+}
+
+func TestMetricsIgnoreFencedAttempts(t *testing.T) {
+	metrics := &recordingMetrics{}
+	queue := testQueue(t, pgoutbox.WithMetrics(metrics), pgoutbox.WithLease(60*time.Millisecond))
+	mustEnqueue(t, queue, "export", uuid.New())
+	stale := mustFoundClaim(t, queue, "export", "worker-1")
+	time.Sleep(100 * time.Millisecond)
+	fresh := mustFoundClaim(t, queue, "export", "worker-2")
+	if mustComplete(t, queue, stale) {
+		t.Fatal("stale worker completed the job")
+	}
+	if mustFail(t, queue, stale, "stale") {
+		t.Fatal("stale worker failed the job")
+	}
+	if !mustComplete(t, queue, fresh) {
+		t.Fatal("fresh worker did not complete the job")
+	}
+	if delivered := metrics.count("delivered"); delivered != 1 {
+		t.Fatalf("delivered callbacks = %d", delivered)
+	}
+	if failed := metrics.count("failed"); failed != 0 {
+		t.Fatalf("failed callbacks = %d", failed)
+	}
+	if pending := metrics.count("pending"); pending != 3 {
+		t.Fatalf("pending callbacks = %d", pending)
+	}
+}
+
+func TestMetricsWorkerDeadLettersDroppedJob(t *testing.T) {
+	metrics := &recordingMetrics{}
+	queue := testQueue(t, pgoutbox.WithMetrics(metrics))
+	worker := mustWorker(t, pgoutbox.WorkerConfig{
+		Queue: queue, Kinds: []string{"drop"}, WorkerID: "worker-1",
+		Handler: func(context.Context, pgoutbox.Job) error {
+			return fmt.Errorf("permanent: %w", pgoutbox.ErrDrop)
+		},
+	})
+	mustEnqueue(t, queue, "drop", uuid.New())
+	if !mustProcess(t, worker) {
+		t.Fatal("worker did not process the job")
+	}
+	mustStatsEqual(t, queue, nil, pgoutbox.Stats{Dead: 1})
+	if deadLettered := metrics.count("dead_lettered"); deadLettered != 1 {
+		t.Fatalf("dead_lettered callbacks = %d", deadLettered)
+	}
+	if failed := metrics.count("failed"); failed != 0 {
+		t.Fatalf("failed callbacks = %d", failed)
+	}
+}
+
+func TestMetricsDropPendingJob(t *testing.T) {
+	metrics := &recordingMetrics{}
+	queue := testQueue(t, pgoutbox.WithMetrics(metrics), pgoutbox.WithMaxAttempts(1))
+	mustEnqueue(t, queue, "export", uuid.New())
+	dead := mustFoundClaim(t, queue, "export", "worker-1")
+	if !mustFail(t, queue, dead, "permanent") {
+		t.Fatal("fail returned false")
+	}
+	if !mustDrop(t, queue, dead.ID) {
+		t.Fatal("drop dead job returned false")
+	}
+	mustEnqueue(t, queue, "export", uuid.New())
+	pending := mustList(t, queue, pgoutbox.StatePending, nil, 10)
+	if len(pending) != 1 {
+		t.Fatalf("pending jobs = %d", len(pending))
+	}
+	if !mustDrop(t, queue, pending[0].ID) {
+		t.Fatal("drop pending job returned false")
+	}
+	mustMetricEvents(t, metrics, []metricEvent{
+		{Name: "published", Kind: "export"},
+		{Name: "pending", Kind: "export", Delta: 1},
+		{Name: "pending", Kind: "export", Delta: -1},
+		{Name: "dead_lettered", Kind: "export"},
+		{Name: "published", Kind: "export"},
+		{Name: "pending", Kind: "export", Delta: 1},
+		{Name: "pending", Kind: "export", Delta: -1},
+	})
+}
+
+func TestDeadLetterListingAndRedelivery(t *testing.T) {
+	ctx := context.Background()
+	queue := testQueue(t, pgoutbox.WithMaxAttempts(1))
+	aggregate := uuid.New()
+	mustEnqueue(t, queue, "export", aggregate)
+	job := mustFoundClaim(t, queue, "export", "worker-1")
+	if !mustFail(t, queue, job, "permanent failure") {
+		t.Fatal("fail returned false")
+	}
+	letters, err := queue.ListDeadLetters(ctx, nil, 10)
+	if err != nil {
+		t.Fatalf("list dead letters: %v", err)
+	}
+	if len(letters) != 1 {
+		t.Fatalf("dead letters = %d", len(letters))
+	}
+	letter := letters[0]
+	if letter.ID != job.ID || letter.AggregateID != aggregate || letter.DeadLetteredAt == nil ||
+		letter.LastError == nil || *letter.LastError != "permanent failure" || len(letter.Payload) == 0 {
+		t.Fatalf("dead letter = %#v", letter)
+	}
+	if filtered, err := queue.ListDeadLetters(ctx, []string{"other"}, 10); err != nil || len(filtered) != 0 {
+		t.Fatalf("filtered dead letters = %d, %v", len(filtered), err)
+	}
+	mustEnqueue(t, queue, "other", uuid.New())
+	pending := mustFoundClaim(t, queue, "other", "worker-1")
+	redelivered, err := queue.Redeliver(ctx, pending.ID)
+	if err != nil {
+		t.Fatalf("redeliver pending job: %v", err)
+	}
+	if redelivered {
+		t.Fatal("redelivered a job that is not dead")
+	}
+	redelivered, err = queue.Redeliver(ctx, job.ID)
+	if err != nil || !redelivered {
+		t.Fatalf("redeliver = %t, %v", redelivered, err)
+	}
+	if empty, err := queue.ListDeadLetters(ctx, nil, 10); err != nil || len(empty) != 0 {
+		t.Fatalf("dead letters after redelivery = %d, %v", len(empty), err)
+	}
+	reclaimed := mustFoundClaim(t, queue, "export", "worker-1")
+	if reclaimed.ID != job.ID || reclaimed.Attempts != 1 {
+		t.Fatalf("reclaimed job = %#v", reclaimed)
+	}
+	if !mustComplete(t, queue, reclaimed) {
+		t.Fatal("complete returned false")
+	}
+}
+
+func TestScheduledJobBecomesClaimableWhenDue(t *testing.T) {
+	queue := testQueue(t)
+	due := time.Now().UTC().Add(100 * time.Millisecond)
+	scheduled := input("export", uuid.New())
+	scheduled.ScheduledAt = &due
+	created, err := queue.Enqueue(context.Background(), scheduled)
+	if err != nil || !created {
+		t.Fatalf("enqueue = %t, %v", created, err)
+	}
+	if _, found := mustClaim(t, queue, "export", "worker-1"); found {
+		t.Fatal("scheduled job was claimed before it was due")
+	}
+	mustStatsEqual(t, queue, nil, pgoutbox.Stats{Pending: 1})
+	worker := mustWorker(t, pgoutbox.WorkerConfig{
+		Queue: queue, Kinds: []string{"export"}, WorkerID: "worker-1",
+		Handler: func(context.Context, pgoutbox.Job) error { return nil },
+	})
+	if mustProcess(t, worker) {
+		t.Fatal("worker processed a scheduled job before it was due")
+	}
+	time.Sleep(200 * time.Millisecond)
+	job := mustFoundClaim(t, queue, "export", "worker-1")
+	if job.AggregateID != scheduled.AggregateID {
+		t.Fatalf("claimed job = %#v", job)
+	}
+	views := mustList(t, queue, pgoutbox.StateAll, nil, 10)
+	if len(views) != 1 || views[0].ScheduledAt == nil ||
+		views[0].ScheduledAt.Sub(due).Abs() > time.Millisecond {
+		t.Fatalf("scheduled view = %#v", views)
+	}
+}
+
+func TestScheduledJobStillHonorsRetryBackoff(t *testing.T) {
+	queue := testQueue(t, pgoutbox.WithBackoff(pgoutbox.Backoff{
+		Base: 200 * time.Millisecond, Max: 200 * time.Millisecond,
+	}))
+	due := time.Now().UTC().Add(100 * time.Millisecond)
+	scheduled := input("export", uuid.New())
+	scheduled.ScheduledAt = &due
+	if created, err := queue.Enqueue(context.Background(), scheduled); err != nil || !created {
+		t.Fatalf("enqueue = %t, %v", created, err)
+	}
+	time.Sleep(200 * time.Millisecond)
+	job := mustFoundClaim(t, queue, "export", "worker-1")
+	if !mustFail(t, queue, job, "outage") {
+		t.Fatal("fail returned false")
+	}
+	if _, found := mustClaim(t, queue, "export", "worker-1"); found {
+		t.Fatal("retry ignored the backoff of a scheduled job")
+	}
+	time.Sleep(250 * time.Millisecond)
+	retried := mustFoundClaim(t, queue, "export", "worker-1")
+	if retried.ID != job.ID || retried.Attempts != 2 {
+		t.Fatalf("retried job = %#v", retried)
+	}
+}
+
+func TestConcurrentWorkersDeliverEachJobOnce(t *testing.T) {
+	ctx := context.Background()
+	queue := testQueue(t)
+	const jobs = 20
+	for range jobs {
+		mustEnqueue(t, queue, "export", uuid.New())
+	}
+	var mu sync.Mutex
+	delivered := make(map[int64]int, jobs)
+	var wait sync.WaitGroup
+	for workerIndex := range 8 {
+		worker := mustWorker(t, pgoutbox.WorkerConfig{
+			Queue: queue, Kinds: []string{"export"},
+			WorkerID: fmt.Sprintf("worker-%d", workerIndex),
+			Handler: func(_ context.Context, job pgoutbox.Job) error {
+				mu.Lock()
+				delivered[job.ID]++
+				mu.Unlock()
+				return nil
+			},
+		})
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			for {
+				processed, err := worker.ProcessNext(ctx)
+				if err != nil {
+					t.Errorf("process next: %v", err)
+					return
+				}
+				if !processed {
+					return
+				}
+			}
+		}()
+	}
+	wait.Wait()
+	if len(delivered) != jobs {
+		t.Fatalf("delivered %d of %d jobs", len(delivered), jobs)
+	}
+	for id, count := range delivered {
+		if count != 1 {
+			t.Fatalf("job %d was delivered %d times", id, count)
+		}
+	}
+	mustStatsEqual(t, queue, nil, pgoutbox.Stats{})
 }

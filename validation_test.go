@@ -34,6 +34,22 @@ func TestOptionsValidate(t *testing.T) {
 	}
 }
 
+type testMetrics struct {
+	NoopMetrics
+}
+
+func TestWithMetricsOption(t *testing.T) {
+	t.Parallel()
+	queue := &Queue{}
+	if err := WithMetrics(nil)(queue); err != nil || queue.metrics != (NoopMetrics{}) {
+		t.Fatalf("WithMetrics(nil) = %v, metrics %#v", err, queue.metrics)
+	}
+	metrics := &testMetrics{}
+	if err := WithMetrics(metrics)(queue); err != nil || queue.metrics != metrics {
+		t.Fatalf("WithMetrics(custom) = %v, metrics %#v", err, queue.metrics)
+	}
+}
+
 func TestEnqueueRejectsInvalidInput(t *testing.T) {
 	t.Parallel()
 	queue := &Queue{}

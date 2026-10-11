@@ -1,6 +1,6 @@
 // Package pgoutbox implements a PostgreSQL-backed job queue: one outbox
 // table, atomic claims with leases, attempt fencing, retries with backoff,
-// and dead-lettering.
+// dead-lettering, delayed messages, and metrics hooks.
 package pgoutbox
 
 import (
@@ -48,6 +48,7 @@ type JobView struct {
 	Job
 
 	AvailableAt    time.Time
+	ScheduledAt    *time.Time // ScheduledAt is the time the job becomes due; nil means immediate.
 	LeasedAt       *time.Time
 	LeaseUntil     *time.Time
 	ProcessedAt    *time.Time
@@ -62,6 +63,7 @@ type EnqueueInput struct {
 	AggregateID   uuid.UUID
 	Generation    int
 	Payload       []byte
+	ScheduledAt   *time.Time // Set to delay the job until the given time; nil makes it due immediately.
 }
 
 type Stats struct {
@@ -87,6 +89,7 @@ type Queue struct {
 	lease       time.Duration
 	backoff     Backoff
 	ordered     bool
+	metrics     Metrics
 }
 
 // EnsureSchema creates the outbox table and its indexes when they are absent.
@@ -110,6 +113,7 @@ func New(pool *pgxpool.Pool, options ...Option) (*Queue, error) {
 		maxAttempts: DefaultMaxAttempts,
 		lease:       DefaultLease,
 		backoff:     DefaultBackoff,
+		metrics:     NoopMetrics{},
 	}
 	for _, option := range options {
 		if option == nil {
@@ -164,8 +168,20 @@ func WithOrderedAggregates(enabled bool) Option {
 	}
 }
 
+// WithMetrics installs the metrics hook. A nil hook keeps the no-op default.
+func WithMetrics(metrics Metrics) Option {
+	return func(queue *Queue) error {
+		if metrics == nil {
+			metrics = NoopMetrics{}
+		}
+		queue.metrics = metrics
+		return nil
+	}
+}
+
 // Enqueue inserts one job. An existing job with the same kind, aggregate, and
-// generation is left alone, and the second call returns false.
+// generation is left alone, and the second call returns false. A ScheduledAt
+// value at or before now makes the job due immediately.
 func (queue *Queue) Enqueue(ctx context.Context, input EnqueueInput) (bool, error) {
 	if ctx == nil {
 		return false, ErrInvalidInput
@@ -178,17 +194,20 @@ func (queue *Queue) Enqueue(ctx context.Context, input EnqueueInput) (bool, erro
 	}
 	var id int64
 	err := queue.pool.QueryRow(ctx, `
-		INSERT INTO outbox_jobs (kind, aggregate_type, aggregate_id, generation, payload)
-		VALUES ($1, $2, $3, $4, $5)
+		INSERT INTO outbox_jobs (kind, aggregate_type, aggregate_id, generation, payload, scheduled_at)
+		VALUES ($1, $2, $3, $4, $5, $6)
 		ON CONFLICT (kind, aggregate_type, aggregate_id, generation) DO NOTHING
 		RETURNING id
-	`, input.Kind, input.AggregateType, input.AggregateID, input.Generation, input.Payload).Scan(&id)
+	`, input.Kind, input.AggregateType, input.AggregateID, input.Generation, input.Payload,
+		input.ScheduledAt).Scan(&id)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return false, nil
 	}
 	if err != nil {
 		return false, fmt.Errorf("enqueue job: %w", err)
 	}
+	queue.metrics.Published(input.Kind)
+	queue.metrics.Pending(input.Kind, 1)
 	return true, nil
 }
 
@@ -222,6 +241,7 @@ func (queue *Queue) ClaimNext(ctx context.Context, kinds []string, workerID stri
 		return job, false, fmt.Errorf("claim job: %w", err)
 	}
 	job.WorkerID = workerID
+	queue.metrics.Pending(job.Kind, -1)
 	return job, true, nil
 }
 
@@ -240,7 +260,11 @@ func (queue *Queue) Complete(ctx context.Context, job Job) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("complete job: %w", err)
 	}
-	return result.RowsAffected() == 1, nil
+	if result.RowsAffected() != 1 {
+		return false, nil
+	}
+	queue.metrics.Delivered(job.Kind)
+	return true, nil
 }
 
 // Fail releases a claimed job with a backoff delay. The job is dead-lettered
@@ -262,7 +286,12 @@ func (queue *Queue) Fail(ctx context.Context, job Job, reason string) (bool, err
 	if err != nil {
 		return false, fmt.Errorf("fail job: %w", err)
 	}
-	return result.RowsAffected() == 1, nil
+	if result.RowsAffected() != 1 {
+		return false, nil
+	}
+	queue.metrics.Failed(job.Kind)
+	queue.metrics.Pending(job.Kind, 1)
+	return true, nil
 }
 
 // DeadLetter marks a claimed job as dead without another attempt.
@@ -281,7 +310,11 @@ func (queue *Queue) DeadLetter(ctx context.Context, job Job, reason string) (boo
 	if err != nil {
 		return false, fmt.Errorf("dead-letter job: %w", err)
 	}
-	return result.RowsAffected() == 1, nil
+	if result.RowsAffected() != 1 {
+		return false, nil
+	}
+	queue.metrics.DeadLettered(job.Kind)
+	return true, nil
 }
 
 // Stats counts pending, leased, and dead jobs. A pending job is due now or
@@ -325,7 +358,7 @@ func (queue *Queue) List(ctx context.Context, state State, kinds []string, limit
 	}
 	rows, err := queue.pool.Query(ctx, `
 		SELECT id, kind, aggregate_type, aggregate_id, generation, payload, attempts,
-		       available_at, leased_at, lease_until, leased_by,
+		       available_at, scheduled_at, leased_at, lease_until, leased_by,
 		       processed_at, dead_lettered_at, last_error, created_at
 		FROM outbox_jobs
 		WHERE ($1::text[] IS NULL OR kind = ANY($1))
@@ -355,6 +388,7 @@ func (queue *Queue) List(ctx context.Context, state State, kinds []string, limit
 			&view.Payload,
 			&view.Attempts,
 			&view.AvailableAt,
+			&view.ScheduledAt,
 			&view.LeasedAt,
 			&view.LeaseUntil,
 			&leasedBy,
@@ -376,34 +410,67 @@ func (queue *Queue) List(ctx context.Context, state State, kinds []string, limit
 	return views, nil
 }
 
-// Retry clears a dead-lettered job and makes it due again with a fresh attempt
-// count.
-func (queue *Queue) Retry(ctx context.Context, id int64) (bool, error) {
+// ListDeadLetters returns dead-lettered jobs with their payload, attempt
+// count, and last error, newest first. An empty kinds list returns every kind.
+func (queue *Queue) ListDeadLetters(ctx context.Context, kinds []string, limit int) ([]JobView, error) {
+	return queue.List(ctx, StateDead, kinds, limit)
+}
+
+// Redeliver clears a dead-lettered job and makes it due again with a fresh
+// attempt count.
+func (queue *Queue) Redeliver(ctx context.Context, id int64) (bool, error) {
 	if ctx == nil || id <= 0 {
 		return false, ErrInvalidInput
 	}
-	result, err := queue.pool.Exec(ctx, `
+	var kind string
+	err := queue.pool.QueryRow(ctx, `
 		UPDATE outbox_jobs
 		SET processed_at = NULL, dead_lettered_at = NULL, attempts = 0, available_at = now(),
 		    leased_at = NULL, lease_until = NULL, leased_by = NULL, last_error = NULL
 		WHERE id = $1 AND dead_lettered_at IS NOT NULL
-	`, id)
-	if err != nil {
-		return false, fmt.Errorf("retry job: %w", err)
+		RETURNING kind
+	`, id).Scan(&kind)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
 	}
-	return result.RowsAffected() == 1, nil
+	if err != nil {
+		return false, fmt.Errorf("redeliver job: %w", err)
+	}
+	queue.metrics.Retried(kind)
+	queue.metrics.Pending(kind, 1)
+	return true, nil
 }
 
-// Drop deletes one job.
+// Retry is an alias for Redeliver.
+func (queue *Queue) Retry(ctx context.Context, id int64) (bool, error) {
+	return queue.Redeliver(ctx, id)
+}
+
+// Drop deletes one job. Dropping a pending job decreases the pending gauge.
 func (queue *Queue) Drop(ctx context.Context, id int64) (bool, error) {
 	if ctx == nil || id <= 0 {
 		return false, ErrInvalidInput
 	}
-	result, err := queue.pool.Exec(ctx, `DELETE FROM outbox_jobs WHERE id = $1`, id)
+	var kind string
+	var pending bool
+	err := queue.pool.QueryRow(ctx, `
+		DELETE FROM outbox_jobs
+		WHERE id = $1
+		RETURNING kind, (
+			processed_at IS NULL AND dead_lettered_at IS NULL
+			AND (lease_until IS NULL OR lease_until <= now())
+		)
+	`, id).Scan(&kind, &pending)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
 	if err != nil {
 		return false, fmt.Errorf("drop job: %w", err)
 	}
-	return result.RowsAffected() == 1, nil
+	if pending {
+		queue.metrics.Pending(kind, -1)
+	}
+	return true, nil
 }
 
 func validPayload(payload []byte) bool {

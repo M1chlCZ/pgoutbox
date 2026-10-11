@@ -7,6 +7,7 @@ CREATE TABLE IF NOT EXISTS outbox_jobs (
     payload jsonb NOT NULL,
     attempts integer NOT NULL DEFAULT 0,
     available_at timestamptz NOT NULL DEFAULT now(),
+    scheduled_at timestamptz,
     leased_at timestamptz,
     lease_until timestamptz,
     leased_by text,
@@ -43,6 +44,8 @@ CREATE TABLE IF NOT EXISTS outbox_jobs (
 CREATE INDEX IF NOT EXISTS outbox_jobs_due_idx
     ON outbox_jobs (available_at, lease_until, id)
     WHERE processed_at IS NULL;
+
+ALTER TABLE outbox_jobs ADD COLUMN IF NOT EXISTS scheduled_at timestamptz;
 
 CREATE INDEX IF NOT EXISTS outbox_jobs_dead_idx
     ON outbox_jobs (dead_lettered_at, id)
