@@ -7,6 +7,7 @@ import (
 	"os"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -738,4 +739,358 @@ func TestConcurrentWorkersDeliverEachJobOnce(t *testing.T) {
 		}
 	}
 	mustStatsEqual(t, queue, nil, pgoutbox.Stats{})
+}
+
+func TestEnqueueBatchInsertsInOrder(t *testing.T) {
+	ctx := context.Background()
+	queue := testQueue(t)
+	aggregates := []uuid.UUID{uuid.New(), uuid.New(), uuid.New()}
+	inputs := make([]pgoutbox.EnqueueInput, len(aggregates))
+	for index, aggregate := range aggregates {
+		inputs[index] = input("export", aggregate)
+	}
+	ids, err := queue.EnqueueBatch(ctx, inputs)
+	if err != nil {
+		t.Fatalf("enqueue batch: %v", err)
+	}
+	if len(ids) != len(inputs) {
+		t.Fatalf("batch IDs = %v", ids)
+	}
+	byAggregate := make(map[uuid.UUID]int64, len(aggregates))
+	for _, view := range mustList(t, queue, pgoutbox.StatePending, nil, 10) {
+		byAggregate[view.AggregateID] = view.ID
+	}
+	for index, aggregate := range aggregates {
+		if ids[index] == 0 || ids[index] != byAggregate[aggregate] {
+			t.Fatalf("batch ID %d = %d, want the job of aggregate %s", index, ids[index], aggregate)
+		}
+	}
+	mustStatsEqual(t, queue, nil, pgoutbox.Stats{Pending: 3})
+}
+
+func TestEnqueueBatchSkipsConflicts(t *testing.T) {
+	ctx := context.Background()
+	queue := testQueue(t)
+	existing := uuid.New()
+	mustEnqueue(t, queue, "export", existing)
+	fresh := uuid.New()
+	ids, err := queue.EnqueueBatch(ctx, []pgoutbox.EnqueueInput{
+		input("export", existing),
+		input("export", fresh),
+		input("export", existing),
+	})
+	if err != nil {
+		t.Fatalf("enqueue batch: %v", err)
+	}
+	if len(ids) != 3 || ids[0] != 0 || ids[2] != 0 || ids[1] == 0 {
+		t.Fatalf("batch IDs = %v", ids)
+	}
+	mustStatsEqual(t, queue, nil, pgoutbox.Stats{Pending: 2})
+}
+
+func TestEnqueueBatchRollsBackOnFailure(t *testing.T) {
+	ctx := context.Background()
+	queue := testQueue(t)
+	failing := input("export", uuid.New())
+	failing.Payload = []byte(`{"value":1e400000}`)
+	ids, err := queue.EnqueueBatch(ctx, []pgoutbox.EnqueueInput{
+		input("export", uuid.New()),
+		failing,
+	})
+	if err == nil {
+		t.Fatalf("enqueue batch accepted a payload PostgreSQL rejects: %v", ids)
+	}
+	mustStatsEqual(t, queue, nil, pgoutbox.Stats{})
+	if views := mustList(t, queue, pgoutbox.StateAll, nil, 10); len(views) != 0 {
+		t.Fatalf("jobs after rollback = %d", len(views))
+	}
+}
+
+func TestClaimBatchClaimsUpToLimit(t *testing.T) {
+	ctx := context.Background()
+	queue := testQueue(t)
+	const jobs = 5
+	for range jobs {
+		mustEnqueue(t, queue, "export", uuid.New())
+	}
+	first, err := queue.ClaimBatch(ctx, []string{"export"}, "worker-1", 3)
+	if err != nil || len(first) != 3 {
+		t.Fatalf("first claim = %d, %v", len(first), err)
+	}
+	for _, job := range first {
+		if job.Attempts != 1 || job.WorkerID != "worker-1" {
+			t.Fatalf("claimed job = %#v", job)
+		}
+	}
+	second, err := queue.ClaimBatch(ctx, []string{"export"}, "worker-2", 3)
+	if err != nil || len(second) != 2 {
+		t.Fatalf("second claim = %d, %v", len(second), err)
+	}
+	for _, job := range second {
+		if job.WorkerID != "worker-2" {
+			t.Fatalf("claimed job = %#v", job)
+		}
+		for _, held := range first {
+			if held.ID == job.ID {
+				t.Fatalf("job %d was claimed twice", job.ID)
+			}
+		}
+	}
+	if empty, err := queue.ClaimBatch(ctx, []string{"export"}, "worker-3", 3); err != nil || len(empty) != 0 {
+		t.Fatalf("claim with every job leased = %d, %v", len(empty), err)
+	}
+	mustStatsEqual(t, queue, nil, pgoutbox.Stats{Leased: 5})
+	for _, job := range append(first, second...) {
+		if !mustComplete(t, queue, job) {
+			t.Fatalf("complete job %d returned false", job.ID)
+		}
+	}
+	mustStatsEqual(t, queue, nil, pgoutbox.Stats{})
+}
+
+func TestClaimBatchPreservesLeaseAndFencing(t *testing.T) {
+	ctx := context.Background()
+	queue := testQueue(t, pgoutbox.WithLease(60*time.Millisecond))
+	mustEnqueue(t, queue, "export", uuid.New())
+	stale, err := queue.ClaimBatch(ctx, []string{"export"}, "worker-1", 10)
+	if err != nil || len(stale) != 1 {
+		t.Fatalf("first claim = %d, %v", len(stale), err)
+	}
+	if held, err := queue.ClaimBatch(ctx, []string{"export"}, "worker-2", 10); err != nil || len(held) != 0 {
+		t.Fatalf("claim while leased = %d, %v", len(held), err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	fresh, err := queue.ClaimBatch(ctx, []string{"export"}, "worker-2", 10)
+	if err != nil || len(fresh) != 1 {
+		t.Fatalf("reclaim = %d, %v", len(fresh), err)
+	}
+	if fresh[0].ID != stale[0].ID || fresh[0].Attempts != 2 || fresh[0].WorkerID != "worker-2" {
+		t.Fatalf("reclaimed job = %#v", fresh[0])
+	}
+	if mustComplete(t, queue, stale[0]) {
+		t.Fatal("stale worker completed the job")
+	}
+	if mustFail(t, queue, stale[0], "stale") {
+		t.Fatal("stale worker failed the job")
+	}
+	if !mustComplete(t, queue, fresh[0]) {
+		t.Fatal("fresh worker did not complete the job")
+	}
+}
+
+func TestClaimBatchConcurrentWorkersAreExclusive(t *testing.T) {
+	ctx := context.Background()
+	queue := testQueue(t)
+	const jobs = 50
+	for range jobs {
+		mustEnqueue(t, queue, "export", uuid.New())
+	}
+	var wait sync.WaitGroup
+	claimed := make(chan int64, jobs)
+	for worker := range 6 {
+		wait.Add(1)
+		go func(id string) {
+			defer wait.Done()
+			for {
+				batch, err := queue.ClaimBatch(ctx, []string{"export"}, id, 7)
+				if err != nil {
+					t.Errorf("claim batch: %v", err)
+					return
+				}
+				if len(batch) == 0 {
+					return
+				}
+				for _, job := range batch {
+					claimed <- job.ID
+				}
+			}
+		}(fmt.Sprintf("worker-%d", worker))
+	}
+	wait.Wait()
+	close(claimed)
+	seen := make(map[int64]bool, jobs)
+	for id := range claimed {
+		if seen[id] {
+			t.Fatalf("job %d was claimed twice", id)
+		}
+		seen[id] = true
+	}
+	if len(seen) != jobs {
+		t.Fatalf("claimed %d of %d jobs", len(seen), jobs)
+	}
+}
+
+func TestClaimBatchOrderedFallsBackToSingleClaims(t *testing.T) {
+	ctx := context.Background()
+	queue := testQueue(t, pgoutbox.WithOrderedAggregates(true))
+	first := uuid.New()
+	second := uuid.New()
+	mustEnqueue(t, queue, "step", first)
+	later := input("step", first)
+	later.Generation = 1
+	if created, err := queue.Enqueue(ctx, later); err != nil || !created {
+		t.Fatalf("enqueue later generation = %t, %v", created, err)
+	}
+	mustEnqueue(t, queue, "step", second)
+	claimed, err := queue.ClaimBatch(ctx, []string{"step"}, "worker-1", 10)
+	if err != nil || len(claimed) != 2 {
+		t.Fatalf("ordered claim = %d, %v", len(claimed), err)
+	}
+	if claimed[0].AggregateID != first || claimed[0].Generation != 0 ||
+		claimed[1].AggregateID != second || claimed[1].Generation != 0 {
+		t.Fatalf("ordered claim = %#v", claimed)
+	}
+	if blocked, err := queue.ClaimBatch(ctx, []string{"step"}, "worker-2", 10); err != nil || len(blocked) != 0 {
+		t.Fatalf("claim with an unprocessed predecessor = %d, %v", len(blocked), err)
+	}
+	if !mustComplete(t, queue, claimed[0]) {
+		t.Fatal("complete returned false")
+	}
+	next, err := queue.ClaimBatch(ctx, []string{"step"}, "worker-2", 10)
+	if err != nil || len(next) != 1 || next[0].AggregateID != first || next[0].Generation != 1 {
+		t.Fatalf("next ordered claim = %#v, %v", next, err)
+	}
+}
+
+func TestWorkerConcurrencyDeliversEachJobOnce(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	queue := testQueue(t)
+	const jobs = 60
+	for range jobs {
+		mustEnqueue(t, queue, "export", uuid.New())
+	}
+	var mutex sync.Mutex
+	delivered := make(map[int64]int, jobs)
+	var workers sync.WaitGroup
+	for workerIndex := range 2 {
+		worker := mustWorker(t, pgoutbox.WorkerConfig{
+			Queue: queue, Kinds: []string{"export"},
+			WorkerID:       fmt.Sprintf("worker-%d", workerIndex),
+			Concurrency:    4,
+			ClaimBatchSize: 5,
+			IdleInterval:   10 * time.Millisecond,
+			Handler: func(_ context.Context, job pgoutbox.Job) error {
+				mutex.Lock()
+				delivered[job.ID]++
+				mutex.Unlock()
+				return nil
+			},
+		})
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			if err := worker.Run(ctx); err != nil {
+				t.Errorf("worker run: %v", err)
+			}
+		}()
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		mutex.Lock()
+		count := len(delivered)
+		mutex.Unlock()
+		if count == jobs {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("delivered %d of %d jobs", count, jobs)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	stopped := make(chan struct{})
+	go func() {
+		workers.Wait()
+		close(stopped)
+	}()
+	select {
+	case <-stopped:
+	case <-time.After(5 * time.Second):
+		t.Fatal("workers did not stop")
+	}
+	mutex.Lock()
+	defer mutex.Unlock()
+	for id, count := range delivered {
+		if count != 1 {
+			t.Fatalf("job %d was delivered %d times", id, count)
+		}
+	}
+	mustStatsEqual(t, queue, nil, pgoutbox.Stats{})
+}
+
+func TestWorkerShutdownDrainsInFlightHandlers(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	queue := testQueue(t)
+	const jobs = 3
+	for range jobs {
+		mustEnqueue(t, queue, "export", uuid.New())
+	}
+	var active atomic.Int64
+	started := make(chan struct{}, jobs)
+	release := make(chan struct{})
+	worker := mustWorker(t, pgoutbox.WorkerConfig{
+		Queue: queue, Kinds: []string{"export"}, WorkerID: "worker-1",
+		Concurrency: 3,
+		Handler: func(context.Context, pgoutbox.Job) error {
+			active.Add(1)
+			started <- struct{}{}
+			<-release
+			active.Add(-1)
+			return nil
+		},
+	})
+	done := make(chan error, 1)
+	go func() { done <- worker.Run(ctx) }()
+	for range jobs {
+		select {
+		case <-started:
+		case <-time.After(3 * time.Second):
+			t.Fatal("handlers did not start")
+		}
+	}
+	cancel()
+	close(release)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run error = %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("worker did not stop")
+	}
+	if remaining := active.Load(); remaining != 0 {
+		t.Fatalf("in-flight handlers after Run = %d", remaining)
+	}
+}
+
+func TestMetricsBatchTransitions(t *testing.T) {
+	ctx := context.Background()
+	metrics := &recordingMetrics{}
+	queue := testQueue(t, pgoutbox.WithMetrics(metrics))
+	aggregate := uuid.New()
+	ids, err := queue.EnqueueBatch(ctx, []pgoutbox.EnqueueInput{
+		input("export", aggregate),
+		input("export", uuid.New()),
+		input("export", aggregate),
+	})
+	if err != nil {
+		t.Fatalf("enqueue batch: %v", err)
+	}
+	if len(ids) != 3 || ids[0] == 0 || ids[1] == 0 || ids[2] != 0 {
+		t.Fatalf("batch IDs = %v", ids)
+	}
+	jobs, err := queue.ClaimBatch(ctx, []string{"export"}, "worker-1", 10)
+	if err != nil || len(jobs) != 2 {
+		t.Fatalf("claim batch = %d, %v", len(jobs), err)
+	}
+	mustMetricEvents(t, metrics, []metricEvent{
+		{Name: "published", Kind: "export"},
+		{Name: "pending", Kind: "export", Delta: 1},
+		{Name: "published", Kind: "export"},
+		{Name: "pending", Kind: "export", Delta: 1},
+		{Name: "pending", Kind: "export", Delta: -1},
+		{Name: "pending", Kind: "export", Delta: -1},
+	})
 }

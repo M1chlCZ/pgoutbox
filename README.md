@@ -5,14 +5,16 @@ A PostgreSQL-backed job queue in one table: atomic claims with leases, attempt f
 ## Features
 
 - One table, `outbox_jobs`. A unique key on kind, aggregate type, aggregate ID, and generation makes a repeated enqueue a no-op.
-- Claims use `FOR UPDATE SKIP LOCKED`, so many workers claim in parallel without blocking each other.
+- Batch publishing. `EnqueueBatch` inserts up to 1000 jobs in one transaction, all-or-nothing.
+- Claims use `FOR UPDATE SKIP LOCKED`, so many workers claim in parallel without blocking each other. `ClaimBatch` claims many jobs with one statement.
 - Leases. A crashed worker leaves a job that another worker reclaims after the lease ends.
 - Attempt fencing. Only the worker that holds the current attempt and lease can complete or fail a job.
 - Retries with exponential backoff and a cap. A job that reaches the attempt limit is dead-lettered.
 - Dead letters stay in the table with their payload and last error. List them and redeliver them with a reset attempt count.
 - Delayed messages. `EnqueueInput.ScheduledAt` makes a job claimable only when due.
 - Optional ordered aggregates: one job per aggregate at a time.
-- Optional `Metrics` hooks for counters and a pending gauge. The default is a no-op; no metrics library is required.
+- Worker concurrency. `Concurrency` parallel claim loops and an optional `ClaimBatchSize`, with the same lease and fencing guarantees.
+- Optional `Metrics` hooks for counters and a pending gauge. The default is a no-op; no metrics library is required. A Prometheus adapter ships in the `prometheus` subpackage.
 - `outboxctl` for operations: stats, list, retry, and drop.
 
 ## Install
@@ -74,6 +76,35 @@ return fmt.Errorf("bad payload: %w", pgoutbox.ErrDrop)
 
 A handler panic is not recovered. The lease expires, and another worker retries the job.
 
+## Batch publishing
+
+`EnqueueBatch` inserts many jobs in one transaction:
+
+```go
+ids, err := queue.EnqueueBatch(ctx, []pgoutbox.EnqueueInput{
+	{Kind: "export", AggregateType: "document", AggregateID: firstID, Payload: []byte(`{"format":"csv"}`)},
+	{Kind: "export", AggregateType: "document", AggregateID: secondID, Payload: []byte(`{"format":"pdf"}`)},
+})
+```
+
+- One call takes at most `MaxBatchSize` (1000) jobs; more returns `ErrBatchTooLarge`.
+- The batch is all-or-nothing. Any error rolls back every insert.
+- `ids[i]` belongs to `inputs[i]` in input order. A zero ID means an existing job with the same dedupe key was left alone, exactly like `Enqueue`; a duplicate inside the batch also yields zero.
+- Metrics fire per inserted job after the commit: `Published` then `Pending(kind, +1)` in input order.
+
+## Batch claiming
+
+`ClaimBatch` claims many due jobs with one statement:
+
+```go
+jobs, err := queue.ClaimBatch(ctx, []string{"export"}, "worker-1", 50)
+```
+
+- The limit must be between 1 and `MaxBatchSize`; more returns `ErrBatchTooLarge`.
+- Claims use one `FOR UPDATE SKIP LOCKED ... LIMIT` statement, so leases and attempt fencing work exactly as in `ClaimNext`, and concurrent workers never receive the same job.
+- With ordered aggregates, `ClaimBatch` falls back to repeated single ordered claims instead of one statement. One call then returns at most one job per aggregate, and later jobs still wait for their predecessors. A failure inside the fallback returns no jobs; jobs claimed before the failure stay leased until the lease expires.
+- Keep a batch small enough to finish inside the lease. A lease that expires mid-batch lets another worker reclaim the unprocessed jobs.
+
 ## Queue options
 
 | Option | Default | Meaning |
@@ -91,6 +122,10 @@ A handler panic is not recovered. The lease expires, and another worker retries 
 | `IdleInterval` | 1 second |
 | `ErrorInterval` | 5 seconds |
 | `JobTimeout` | 1 minute |
+| `Concurrency` | 1 |
+| `ClaimBatchSize` | 0 (off) |
+
+`Concurrency` starts that many parallel claim loops when the worker runs. Every loop shares `WorkerID`; leases and attempt fencing keep them from double-processing a job. `ClaimBatchSize` from 2 to `MaxBatchSize` makes each loop claim a batch per statement; 0 or 1 keeps the single-job loop. Ordered aggregates always claim one job at a time. `Run` returns after every loop has stopped, so an in-flight handler finishes before shutdown completes.
 
 ## Metrics hooks
 
@@ -100,12 +135,12 @@ Every callback is synchronous, inside the goroutine that performed the database 
 
 | Callback | Fires when |
 | --- | --- |
-| `Published(kind)` | `Enqueue` inserted a new job. |
+| `Published(kind)` | `Enqueue` inserted a new job, or one position of `EnqueueBatch` did. |
 | `Delivered(kind)` | `Complete` marked a claimed job processed. |
 | `Failed(kind)` | `Fail` returned a claimed job to pending with a backoff delay. A failure at the attempt limit calls `DeadLettered` instead. |
 | `Retried(kind)` | `Redeliver` or `Retry` returned a dead-lettered job to pending. |
 | `DeadLettered(kind)` | A claimed job entered the dead-letter state: `DeadLetter`, `Fail` at the attempt limit, or a worker error wrapping `ErrDrop`. |
-| `Pending(kind, delta)` | The pending count changed: +1 on publish, retryable failure, and redelivery; -1 on a claim and on dropping a pending job. A lease that expires without a later `Complete`, `Fail`, or `DeadLetter` call is not observed. |
+| `Pending(kind, delta)` | The pending count changed: +1 on publish, retryable failure, and redelivery; -1 on a claim (`ClaimNext` or each job of `ClaimBatch`) and on dropping a pending job. A lease that expires without a later `Complete`, `Fail`, or `DeadLetter` call is not observed. |
 
 A failed attempt calls `Failed` before `Pending`. Redelivery calls `Retried` before `Pending`. Embed `NoopMetrics` to override only the methods you need:
 
@@ -121,6 +156,34 @@ func (m *shopMetrics) Published(string) {
 
 queue, err := pgoutbox.New(pool, pgoutbox.WithMetrics(&shopMetrics{}))
 ```
+
+## Prometheus adapter
+
+The subpackage `github.com/m1chlcz/pgoutbox/prometheus` adapts `Metrics` to Prometheus collectors. The core package keeps no Prometheus dependency:
+
+```go
+import (
+	"github.com/prometheus/client_golang/prometheus"
+
+	outboxprometheus "github.com/m1chlcz/pgoutbox/prometheus"
+)
+
+adapter := outboxprometheus.New(prometheus.DefaultRegisterer, "pgoutbox")
+queue, err := pgoutbox.New(pool, pgoutbox.WithMetrics(adapter))
+```
+
+With the namespace `pgoutbox` the adapter exports:
+
+| Metric | Type |
+| --- | --- |
+| `pgoutbox_jobs_published_total{kind}` | counter |
+| `pgoutbox_jobs_delivered_total{kind}` | counter |
+| `pgoutbox_jobs_failed_total{kind}` | counter |
+| `pgoutbox_jobs_retried_total{kind}` | counter |
+| `pgoutbox_jobs_dead_lettered_total{kind}` | counter |
+| `pgoutbox_jobs_pending{kind}` | gauge |
+
+`New` panics when the registerer already has one of the collectors, so pass a fresh registry or the default registerer once. A nil registerer uses `prometheus.DefaultRegisterer`. An empty namespace omits the prefix.
 
 ## Dead letters
 

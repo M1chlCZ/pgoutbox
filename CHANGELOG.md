@@ -5,6 +5,36 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Batch publishing: `EnqueueBatch` inserts up to `MaxBatchSize` (1000) jobs in
+  one transaction. The batch is all-or-nothing; returned IDs match the input
+  order, and a zero ID marks a job that already existed. `ErrBatchTooLarge`
+  reports a size above the limit. Metrics fire for the inserted jobs after the
+  commit.
+- Batch claiming: `ClaimBatch` claims up to `MaxBatchSize` due jobs with one
+  `FOR UPDATE SKIP LOCKED ... LIMIT` statement and the same leases and attempt
+  fencing as `ClaimNext`. With ordered aggregates it falls back to repeated
+  single ordered claims, so one call returns at most one job per aggregate.
+- Worker concurrency: `WorkerConfig.Concurrency` runs parallel claim loops and
+  `WorkerConfig.ClaimBatchSize` claims jobs in batches per statement. Shutdown
+  still drains in-flight handlers before `Run` returns.
+- Prometheus adapter: the new `github.com/m1chlcz/pgoutbox/prometheus`
+  subpackage implements `Metrics` with per-kind counters and a pending gauge.
+  The core package stays free of the Prometheus dependency.
+- Tests for batch atomicity, batch claims under concurrent workers, lease and
+  fencing through `ClaimBatch`, ordered batch claims, worker concurrency and
+  handler draining, batch metric transitions, and the adapter collectors.
+
+### Changed
+
+- `WorkerConfig` gains `Concurrency` (default 1) and `ClaimBatchSize`
+  (default 0, single-job claims); the zero values keep the previous behavior.
+- `NewWorker` rejects a negative concurrency and a claim batch size outside
+  zero to `MaxBatchSize` with `ErrWorkerConfig`.
+
 ## [0.2.0] - 2026-11-01
 
 ### Added

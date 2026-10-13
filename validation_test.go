@@ -64,6 +64,26 @@ func TestEnqueueRejectsInvalidInput(t *testing.T) {
 	}
 }
 
+func TestEnqueueBatchRejectsInvalidInput(t *testing.T) {
+	t.Parallel()
+	queue := &Queue{}
+	ctx := context.Background()
+	valid := []EnqueueInput{{Kind: "export", AggregateType: "widget", AggregateID: uuid.New(), Payload: []byte(`{}`)}}
+	if _, err := queue.EnqueueBatch(nil, valid); !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("EnqueueBatch with a nil context error = %v", err)
+	}
+	if _, err := queue.EnqueueBatch(ctx, nil); !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("EnqueueBatch with no jobs error = %v", err)
+	}
+	if _, err := queue.EnqueueBatch(ctx, make([]EnqueueInput, MaxBatchSize+1)); !errors.Is(err, ErrBatchTooLarge) {
+		t.Fatalf("EnqueueBatch above the limit error = %v", err)
+	}
+	invalid := []EnqueueInput{valid[0], {Kind: " ", AggregateType: "widget", AggregateID: uuid.New(), Payload: []byte(`{}`)}}
+	if _, err := queue.EnqueueBatch(ctx, invalid); !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("EnqueueBatch with an invalid job error = %v", err)
+	}
+}
+
 func TestClaimRejectsInvalidInput(t *testing.T) {
 	t.Parallel()
 	queue := &Queue{}
@@ -75,10 +95,45 @@ func TestClaimRejectsInvalidInput(t *testing.T) {
 	}
 }
 
+func TestClaimBatchRejectsInvalidInput(t *testing.T) {
+	t.Parallel()
+	queue := &Queue{}
+	ctx := context.Background()
+	if _, err := queue.ClaimBatch(nil, []string{"export"}, "worker", 1); !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("ClaimBatch with a nil context error = %v", err)
+	}
+	if _, err := queue.ClaimBatch(ctx, nil, "worker", 1); !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("ClaimBatch with no kinds error = %v", err)
+	}
+	if _, err := queue.ClaimBatch(ctx, []string{"export"}, " ", 1); !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("ClaimBatch with a blank worker error = %v", err)
+	}
+	if _, err := queue.ClaimBatch(ctx, []string{"export"}, "worker", 0); !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("ClaimBatch with a zero limit error = %v", err)
+	}
+	if _, err := queue.ClaimBatch(ctx, []string{"export"}, "worker", MaxBatchSize+1); !errors.Is(err, ErrBatchTooLarge) {
+		t.Fatalf("ClaimBatch above the limit error = %v", err)
+	}
+}
+
 func TestNewWorkerValidatesConfig(t *testing.T) {
 	t.Parallel()
 	if _, err := NewWorker(WorkerConfig{}); !errors.Is(err, ErrWorkerConfig) {
 		t.Fatalf("NewWorker({}) error = %v", err)
+	}
+	if _, err := NewWorker(WorkerConfig{
+		Queue: &Queue{}, Kinds: []string{"export"}, Handler: func(context.Context, Job) error { return nil },
+		WorkerID: "worker-1", Concurrency: -1,
+	}); !errors.Is(err, ErrWorkerConfig) {
+		t.Fatalf("NewWorker with a negative concurrency error = %v", err)
+	}
+	for _, size := range []int{-1, MaxBatchSize + 1} {
+		if _, err := NewWorker(WorkerConfig{
+			Queue: &Queue{}, Kinds: []string{"export"}, Handler: func(context.Context, Job) error { return nil },
+			WorkerID: "worker-1", ClaimBatchSize: size,
+		}); !errors.Is(err, ErrWorkerConfig) {
+			t.Fatalf("NewWorker with claim batch size %d error = %v", size, err)
+		}
 	}
 	worker, err := NewWorker(WorkerConfig{
 		Queue:    &Queue{},
@@ -90,7 +145,7 @@ func TestNewWorkerValidatesConfig(t *testing.T) {
 		t.Fatalf("NewWorker error = %v", err)
 	}
 	if worker.idleInterval != DefaultIdleInterval || worker.errorInterval != DefaultErrorInterval ||
-		worker.jobTimeout != DefaultJobTimeout {
+		worker.jobTimeout != DefaultJobTimeout || worker.concurrency != 1 || worker.claimBatchSize != 0 {
 		t.Fatalf("worker defaults = %+v", worker)
 	}
 }

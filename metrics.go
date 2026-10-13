@@ -11,7 +11,7 @@ package pgoutbox
 //
 // The callbacks fire as follows:
 //
-//   - Published: Enqueue inserted a new job.
+//   - Published: Enqueue or one position of EnqueueBatch inserted a new job.
 //   - Delivered: Complete marked a claimed job processed.
 //   - Failed: Fail returned a claimed job to pending with a backoff delay.
 //     A failure at the attempt limit calls DeadLettered instead.
@@ -21,9 +21,9 @@ package pgoutbox
 //     error that wraps ErrDrop.
 //   - Pending: the pending count changed. The delta is +1 on publish, on a
 //     failed attempt with a retry, and on redelivery. The delta is -1 on a
-//     claim and on dropping a pending job. Completion and dead-lettering fire
-//     no Pending callback because the job left the pending count when it was
-//     claimed.
+//     claim, through ClaimNext or each job of ClaimBatch, and on dropping a
+//     pending job. Completion and dead-lettering fire no Pending callback
+//     because the job left the pending count when it was claimed.
 //
 // A failed attempt calls Failed before Pending. Redelivery calls Retried
 // before Pending. A lease that expires without a later Complete, Fail, or

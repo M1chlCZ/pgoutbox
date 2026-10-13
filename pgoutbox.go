@@ -23,14 +23,19 @@ var schemaSQL string
 const (
 	DefaultMaxAttempts = 10
 	DefaultLease       = time.Minute
-	maxReasonLength    = 500
+
+	// MaxBatchSize bounds one EnqueueBatch or ClaimBatch call.
+	MaxBatchSize = 1000
+
+	maxReasonLength = 500
 )
 
 var (
-	ErrPoolRequired = errors.New("pgoutbox pool is required")
-	ErrInvalidInput = errors.New("pgoutbox input is invalid")
-	ErrWorkerConfig = errors.New("pgoutbox worker configuration is invalid")
-	ErrDrop         = errors.New("pgoutbox drop job")
+	ErrPoolRequired  = errors.New("pgoutbox pool is required")
+	ErrInvalidInput  = errors.New("pgoutbox input is invalid")
+	ErrBatchTooLarge = errors.New("pgoutbox batch exceeds the maximum size")
+	ErrWorkerConfig  = errors.New("pgoutbox worker configuration is invalid")
+	ErrDrop          = errors.New("pgoutbox drop job")
 )
 
 type Job struct {
@@ -211,6 +216,76 @@ func (queue *Queue) Enqueue(ctx context.Context, input EnqueueInput) (bool, erro
 	return true, nil
 }
 
+// EnqueueBatch inserts up to MaxBatchSize jobs in one transaction. Any error
+// rolls the whole batch back, so the batch is all-or-nothing. The returned
+// slice matches the input order: a position holds the inserted job ID, or
+// zero when an existing job with the same kind, aggregate, and generation was
+// left alone. Deduplication inside the batch follows the same rule. Metrics
+// fire for the inserted jobs in input order after the commit.
+func (queue *Queue) EnqueueBatch(ctx context.Context, inputs []EnqueueInput) ([]int64, error) {
+	if ctx == nil || len(inputs) == 0 {
+		return nil, ErrInvalidInput
+	}
+	if len(inputs) > MaxBatchSize {
+		return nil, ErrBatchTooLarge
+	}
+	normalized := make([]EnqueueInput, len(inputs))
+	for index, input := range inputs {
+		input.Kind = strings.TrimSpace(input.Kind)
+		input.AggregateType = strings.TrimSpace(input.AggregateType)
+		if input.Kind == "" || input.AggregateType == "" || input.AggregateID == uuid.Nil ||
+			input.Generation < 0 || !validPayload(input.Payload) {
+			return nil, ErrInvalidInput
+		}
+		normalized[index] = input
+	}
+	transaction, err := queue.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("enqueue batch: %w", err)
+	}
+	defer func() {
+		_ = transaction.Rollback(ctx)
+	}()
+	batch := &pgx.Batch{}
+	for _, input := range normalized {
+		batch.Queue(`
+			INSERT INTO outbox_jobs (kind, aggregate_type, aggregate_id, generation, payload, scheduled_at)
+			VALUES ($1, $2, $3, $4, $5, $6)
+			ON CONFLICT (kind, aggregate_type, aggregate_id, generation) DO NOTHING
+			RETURNING id
+		`, input.Kind, input.AggregateType, input.AggregateID, input.Generation, input.Payload,
+			input.ScheduledAt)
+	}
+	results := transaction.SendBatch(ctx, batch)
+	ids := make([]int64, len(normalized))
+	for index := range normalized {
+		var id int64
+		err = results.QueryRow().Scan(&id)
+		if errors.Is(err, pgx.ErrNoRows) {
+			continue
+		}
+		if err != nil {
+			_ = results.Close()
+			return nil, fmt.Errorf("enqueue batch: %w", err)
+		}
+		ids[index] = id
+	}
+	if err = results.Close(); err != nil {
+		return nil, fmt.Errorf("enqueue batch: %w", err)
+	}
+	if err = transaction.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("enqueue batch: %w", err)
+	}
+	for index, id := range ids {
+		if id == 0 {
+			continue
+		}
+		queue.metrics.Published(normalized[index].Kind)
+		queue.metrics.Pending(normalized[index].Kind, 1)
+	}
+	return ids, nil
+}
+
 // ClaimNext claims one due job of the given kinds with a lease. It returns
 // false when no job is due.
 func (queue *Queue) ClaimNext(ctx context.Context, kinds []string, workerID string) (Job, bool, error) {
@@ -223,17 +298,9 @@ func (queue *Queue) ClaimNext(ctx context.Context, kinds []string, workerID stri
 		return job, false, ErrInvalidInput
 	}
 	now := time.Now().UTC()
-	err := queue.pool.QueryRow(ctx, claimSQL(queue.ordered),
+	err := scanClaim(queue.pool.QueryRow(ctx, claimSQL(queue.ordered),
 		now, kinds, now.Add(queue.lease), workerID,
-	).Scan(
-		&job.ID,
-		&job.Kind,
-		&job.AggregateType,
-		&job.AggregateID,
-		&job.Generation,
-		&job.Payload,
-		&job.Attempts,
-	)
+	), &job)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return job, false, nil
 	}
@@ -243,6 +310,60 @@ func (queue *Queue) ClaimNext(ctx context.Context, kinds []string, workerID stri
 	job.WorkerID = workerID
 	queue.metrics.Pending(job.Kind, -1)
 	return job, true, nil
+}
+
+// ClaimBatch claims up to limit due jobs of the given kinds in one
+// FOR UPDATE SKIP LOCKED statement. Limit must be between 1 and MaxBatchSize.
+// Every claimed job receives the same lease and attempt fencing as ClaimNext;
+// the returned jobs are ordered like the candidate selection, by availability
+// and ID. It returns an empty slice when no job is due.
+//
+// With ordered aggregates, ClaimBatch falls back to repeated single claims to
+// preserve ordering, so one call returns at most one job per aggregate and a
+// job still waits for every earlier job of the same kind and aggregate. A
+// failure inside the fallback returns no jobs; jobs claimed before the failure
+// stay leased until the lease expires.
+func (queue *Queue) ClaimBatch(ctx context.Context, kinds []string, workerID string, limit int) ([]Job, error) {
+	if ctx == nil || len(kinds) == 0 {
+		return nil, ErrInvalidInput
+	}
+	workerID = strings.TrimSpace(workerID)
+	if workerID == "" || len(workerID) > 100 || strings.ContainsAny(workerID, "\r\n\x00") {
+		return nil, ErrInvalidInput
+	}
+	if limit < 1 {
+		return nil, ErrInvalidInput
+	}
+	if limit > MaxBatchSize {
+		return nil, ErrBatchTooLarge
+	}
+	if queue.ordered {
+		return queue.claimOrderedBatch(ctx, kinds, workerID, limit)
+	}
+	now := time.Now().UTC()
+	rows, err := queue.pool.Query(ctx, claimBatchSQL,
+		now, kinds, now.Add(queue.lease), workerID, limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("claim jobs: %w", err)
+	}
+	defer rows.Close()
+	jobs := []Job{}
+	for rows.Next() {
+		var job Job
+		if err = scanClaim(rows, &job); err != nil {
+			return nil, fmt.Errorf("scan job: %w", err)
+		}
+		job.WorkerID = workerID
+		jobs = append(jobs, job)
+	}
+	if err = rows.Err(); err != nil {
+		return nil, fmt.Errorf("claim jobs: %w", err)
+	}
+	for _, job := range jobs {
+		queue.metrics.Pending(job.Kind, -1)
+	}
+	return jobs, nil
 }
 
 // Complete marks a claimed job as processed. It returns false when the attempt
